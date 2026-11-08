@@ -132,6 +132,15 @@ Every command is dropped unless the sender holds fresh control: the others are o
 see everything and change nothing (#397). `ObserverIds` lists the few requests an observer may
 send. A client can't take control from a live operator, only fill an empty seat.
 
+### Section control timing
+`SectionControlService` runs every section by its own button state (Off / Auto / On); the master
+buttons only set them all, as AgOpenGPS. In Auto the look-ahead asks for on/off early: the
+**module** gets that request at once (`IsCommandedOn` → PGN 239/229 bits), while `IsOn` and the
+coverage map wait the look-ahead time, so the valve acts at the edge and the map paints where
+the product lands (#707). With look-ahead off at 0 the turn-off delay is a plain overrun of both.
+The control loop sends the PGNs at 100 Hz, PGN 229 every tick whatever the section count (the
+ISOBUS task controller reads sections from 229 only).
+
 ### Host ↔ client commands
 The client sends `id|arg` strings (`transport.send('track.select|0')`). `RemoteServerWiring`
 (in `RemoteWiring`) switches on the id and calls the VM; `RemoteServerWiring.Helpers.cs` holds
@@ -454,6 +463,10 @@ dotnet run --project TestRunner/TestRunner.csproj
 - `AgOpenWeb.VehicleToolScenarios.Tests` - Vehicle & Tool scenarios: a simulated machine (steering, implement linkage, antenna on a slope, the Boards simulator's GPS/IMU/motor) drives the whole backend; a careful operator on five vehicles and their implements, a careless one with wrong measures, signs, units, roll setup and profiles; a findings report; CI only builds it, `vehicle-tool-scenarios.yml` runs it nightly (its `README.md`)
 - `AgOpenWeb.FieldScenarios.Tests` - end-to-end field scenarios: the whole backend in-process, a careful and a careless operator on five real field shapes, a findings report; about 4 minutes, so CI only builds it and `field-scenarios.yml` runs it nightly (its `README.md`)
 - `AgOpenWeb.SteerWizardScenarios.Tests` - end-to-end steer wizard scenarios: the whole backend in-process, an emulated AiO steer module (firmware P controller, WAS formula, locks, either motor wiring) and a moving tractor, a careful and a careless operator, a safety watch on the wheels at 50 Hz, a findings report; about 10 minutes, so CI only builds it and `steer-wizard-scenarios.yml` runs it nightly (its `README.md`)
+- `AgOpenWeb.MachineModuleScenarios.Tests` - an emulated Sprayer_ESP32 machine module on the real UDP: sections vs valves, settings reaching the module, restarts and outages (`machine-module-scenarios.yml`)
+- `AgOpenWeb.GpsNtripScenarios.Tests` - receivers, sentence families and an NTRIP caster on the loopback: corrections, network changes, dual heading (`gps-ntrip-scenarios.yml`; one scenario needs Linux's 127.0.0.2)
+- `AgOpenWeb.FieldJobScenarios.Tests` - whole jobs on real fields with AutoSteer, U-turns and auto sections, measuring where product really went on a 0.2 m grid (`field-job-scenarios.yml`, up to 2 h)
+- `AgOpenWeb.IsobusScenarios.Tests` - an emulated AOG-TaskController and its implements (`isobus-scenarios.yml`)
 
 CI also runs `Tools/i18n-extract.py --check` so `en.json` stays current, `Tools/license-headers.py --check` for the licence headers, and `Tools/i18n-limits.py --check` (job `translations-fit`, only when a change touches `wwwroot/`, the check, its baseline or the workflow; otherwise skipped, which counts as passed) so every translated label fits the English layout.
 
@@ -467,6 +480,8 @@ turns from the on-screen buttons) with paths built by `YouTurnCreationService`:
 - Rows wider than twice the turn radius (a wide spreader, skipped rows) get AgOpenGPS's wide turn (`CreateCurveWideTurn`): a quarter circle out of the pass, tangent to the turn line, the turn line itself, a quarter circle into the next pass, so the distance from the boundary holds on an angled headland (#544). The omega turn (one shape square to the track) is the fallback when it can't be built.
 - Manual: a Dubins path at the configured `UTurnRadius` from 4 m ahead of the tractor to the point abreast on the target pass (an omega when the radius exceeds half the pass offset), laid out along the track's local heading (the curve's heading at the nearest point); the path's first point is the tractor itself. Like AgOpenGPS `BuildManualYouTurn`.
 - The turn hands back to line guidance with 4 m of arc remaining (`EarlyCompletionLookahead`).
+- The turn is built from the headland crossing **ahead** of the tractor (`FindTrackHeadlandIntersectionAhead`; one behind only past the last crossing). When no real turn fits, the simple fallback (a semicircle) is used only if every point of it stays in the field, outside obstacles a turn may not drive through (`LeavesField`, #698); otherwise no turn and the creation-failed sound, as AgOpenGPS (which has no fallback). A hard boundary refuses a turn that would start under or behind the tractor.
+- The next pass must have room at this end: at least 20 m of it inside the cultivated area back from the end ahead (`IsPathLandable` / `LandingLength`), not just any piece of it inside the field; otherwise "End of field reached - no room on the next pass at this end" (#712). Driving on across a headland gap to the next piece is not done (an enhancement).
 
 Key parameters:
 - `HeadlandDistance` - width of headland zone (green to yellow line)
@@ -477,7 +492,7 @@ The arc must fit between the headland boundary (green line) and outer boundary (
 
 ## CI/CD
 
-Three GitHub Actions workflows, split by purpose:
+GitHub Actions workflows, split by purpose:
 
 - **`build-and-release.yml`** ("CI") — on every push / PR to `main`: runs the test suite plus a
   compile-check of each platform head (Desktop, Android, iOS). No packaging, no releases.
@@ -494,11 +509,14 @@ Three GitHub Actions workflows, split by purpose:
     beta from `develop` right away (title carries build time + commit); `release` publishes
     the Release named by `release_tag`; `none` builds + uploads artifacts only (dry run).
 
-- **`field-scenarios.yml`** — nightly on `develop` (when it has a commit from the last day) or by hand:
-  runs the field scenario harness (`Tests/AgOpenWeb.FieldScenarios.Tests`, real UDP included) and keeps
-  its findings report as an artifact and in the run's summary. PR CI only builds the harness.
-- **`steer-wizard-scenarios.yml`** — the same for the steer wizard harness (`Tests/AgOpenWeb.SteerWizardScenarios.Tests`),
-  at 03:30 UTC; it also fails when its safety watch saw the wheels move when they shouldn't.
+- **Scenario harnesses, nightly** — seven workflows, each running one harness on `develop` (when it has a
+  commit from the last 25 hours) or by hand, keeping its findings report as an artifact and in the run's
+  summary; PR CI only builds them. They start just after midnight US Central, off the hour (GitHub delays
+  scheduled runs set on the hour), each on its own runner: `field-scenarios.yml` 06:07 UTC,
+  `steer-wizard-scenarios.yml` 06:11 (also fails when its safety watch saw the wheels move when they
+  shouldn't), `vehicle-tool-scenarios.yml` 06:13, `machine-module-scenarios.yml` 06:17,
+  `gps-ntrip-scenarios.yml` 06:19, `field-job-scenarios.yml` 06:23 (the longest, up to 2 h),
+  `isobus-scenarios.yml` 06:29. Each harness's `README.md` says what it covers.
 
 To cut a release (about weekly, so each one stays small): bump `sys/version.h` and the three heads' display versions, then push a tag — `git tag v26.7.x && git push origin v26.7.x`. A summary on top of the generated list goes in with `gh release edit`.
 
